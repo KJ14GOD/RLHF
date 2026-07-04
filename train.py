@@ -34,9 +34,6 @@ def main():
     dataset = load_dataset("Anthropic/hh-rlhf", data_dir="helpful-base")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.truncation_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-    
-
 
     # GPT-2 style tokenizers do not have a padding token by default.
     # For batching, we reuse the end-of-text token as padding.
@@ -53,7 +50,6 @@ def main():
 
     first_example = train_data[0]
 
-
     # reward model reads tensors
     chosen_tokens = tokenizer(
         first_example["chosen"],
@@ -62,7 +58,6 @@ def main():
         padding="max_length",
         return_tensors="pt",
     )
-
     rejected_tokens = tokenizer(
         first_example["rejected"],
         max_length=MAX_LENGTH,
@@ -74,44 +69,44 @@ def main():
     # attention mask marks 1 as a real token and 0 as a padding token. tells the model this is text and this is padding
     # .shape represents [batch size, sequence length]
 
-
-    print("\n" + "=" * 80)
-    print("Tokenized first example")
-    print("chosen input_ids shape:", chosen_tokens["input_ids"].shape)
-    print("chosen attention_mask shape:", chosen_tokens["attention_mask"].shape)
-    print("rejected input_ids shape:", rejected_tokens["input_ids"].shape)
-    print("rejected attention_mask shape:", rejected_tokens["attention_mask"].shape)
-    print("first 20 chosen token ids:", chosen_tokens["input_ids"][0, :20])
-    print("decoded first 20 chosen tokens:")
-    print(tokenizer.decode(chosen_tokens["input_ids"][0, :20]))
-
-
-    model.eval()
-
+    reward_model = RewardModel()
+    reward_model.eval()
+    
     with torch.no_grad():
-        outputs = model(
-            input_ids = chosen_tokens["input_ids"],
-            attention_mask = chosen_tokens["attention_mask"],
-            output_hidden_states=True,
+        chosen_score = reward_model(
+            chosen_tokens["input_ids"],
+            chosen_tokens["attention_mask"],
+        )
+        rejected_score = reward_model(
+            rejected_tokens["input_ids"],
+            rejected_tokens["attention_mask"],
         )
     
-    # get the last hidden state which represents the value
-    last_hidden = outputs.hidden_states[-1] 
-    last_token_index = chosen_tokens["attention_mask"].sum(dim=1) - 1 # last token in an example 
-
-    # gpu optimization step
-    batch_index = torch.arange(chosen_tokens["input_ids"].shape[0])
-    final_token_hidden = last_hidden[batch_index, last_token_index] # grabs the hidden vector at the last token position
     
-    reward_head = nn.Linear(final_token_hidden.shape[-1], 1)
-    score = reward_head(final_token_hidden)
+    print("chosen score:", chosen_score)
+    print("rejected score:", rejected_score)
 
-    print("last hidden shape:", last_hidden.shape)
-    print("last token index:", last_token_index)
-    print("final token hidden shape:", final_token_hidden.shape)
-    print("reward score shape:", score.shape)
-    print("reward score:", score)
+class RewardModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+        hidden_size = self.backbone.config.hidden_size
+        self.reward_head = nn.Linear(hidden_size, 1) # in our case it will be 768 
 
+    def forward(self, input_ids, attention_mask):
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        # get the last hidden state which represents the value
+        last_hidden = outputs.hidden_states[-1]
+        last_token_index = attention_mask.sum(dim=1) - 1 # last token in an example
+        batch_index = torch.arange(input_ids.shape[0]) # gpu optimization step 
+        final_token_hidden = last_hidden[batch_index, last_token_index] # grabs the hidden vector at the last token position
+
+        score = self.reward_head(final_token_hidden)
+        return score
 
 # 1. Pass tokens through distilgpt2 backbone
 # 2. Get hidden states for every token
