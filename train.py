@@ -31,8 +31,9 @@ import torch.nn.functional as F
 MODEL_NAME = "distilgpt2"
 MAX_LENGTH = 512
 LEARNING_RATE = 1e-5
-TRAIN_EXAMPLES = 100
+TRAIN_EXAMPLES = 500
 PRINT_EVERY = 10
+NUM_EPOCHS = 2
 
 def get_device():
     if torch.cuda.is_available():
@@ -62,9 +63,6 @@ def main():
     print("One row has these columns:", train_data.column_names)
     print("Number of training examples:", len(train_data))
 
-    first_example = train_data[0]
-    print("First example keys:", first_example.keys())
-
     select_sample = train_data.select(range(TRAIN_EXAMPLES))
     print("select sample", select_sample)
 
@@ -72,69 +70,73 @@ def main():
     optimizer = torch.optim.AdamW(reward_model.parameters(), lr=LEARNING_RATE)
     reward_model.train()
 
-    total_loss = 0.0
-    total_correct = 0
-    total_examples = 0
+    for epoch in range(NUM_EPOCHS):
+        total_loss = 0.0
+        total_correct = 0
+        total_examples = 0
 
-    for i in range(len(select_sample)):
-        example = select_sample[i]
-        chosen_tokens = tokenizer(
-            example["chosen"],
-            max_length=MAX_LENGTH,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-        )
+        print(f"\nStarting epoch {epoch + 1}/{NUM_EPOCHS}")
 
-        rejected_tokens = tokenizer(
-            example["rejected"],
-            max_length=MAX_LENGTH,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-        )
-
-        # attention mask marks 1 as a real token and 0 as a padding token. Tells the model this is text and this is padding
-        # .shape represents [batch size, sequence length]
-
-        chosen_input_ids = chosen_tokens["input_ids"].to(device)
-        chosen_attention_mask = chosen_tokens["attention_mask"].to(device)
-        rejected_input_ids = rejected_tokens["input_ids"].to(device)
-        rejected_attention_mask = rejected_tokens["attention_mask"].to(device)
-
-        chosen_score = reward_model(
-            chosen_input_ids,
-            chosen_attention_mask,
-        )
-        rejected_score = reward_model(
-            rejected_input_ids,
-            rejected_attention_mask,
-        )
-
-        loss = -F.logsigmoid(chosen_score - rejected_score).mean()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        with torch.no_grad():
-            correct = (chosen_score > rejected_score).float().item()
-            total_correct += correct
-            total_examples += 1
-            total_loss += loss.item()
-
-        if (i + 1) % PRINT_EVERY == 0:
-            avg_loss = total_loss / total_examples
-            accuracy = total_correct / total_examples
-            print(
-                f"step {i + 1}/{len(select_sample)} "
-                f"loss={avg_loss:.4f} accuracy={accuracy:.4f} "
-                f"chosen_score={chosen_score.item():.4f} "
-                f"rejected_score={rejected_score.item():.4f}"
+        for i in range(len(select_sample)):
+            example = select_sample[i]
+            chosen_tokens = tokenizer(
+                example["chosen"],
+                max_length=MAX_LENGTH,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
             )
 
-    print("Final average loss:", total_loss / total_examples)
-    print("Final training accuracy:", total_correct / total_examples)
+            rejected_tokens = tokenizer(
+                example["rejected"],
+                max_length=MAX_LENGTH,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+
+            # attention mask marks 1 as a real token and 0 as a padding token. Tells the model this is text and this is padding
+            # .shape represents [batch size, sequence length]
+
+            chosen_input_ids = chosen_tokens["input_ids"].to(device)
+            chosen_attention_mask = chosen_tokens["attention_mask"].to(device)
+            rejected_input_ids = rejected_tokens["input_ids"].to(device)
+            rejected_attention_mask = rejected_tokens["attention_mask"].to(device)
+
+            chosen_score = reward_model(
+                chosen_input_ids,
+                chosen_attention_mask,
+            )
+            rejected_score = reward_model(
+                rejected_input_ids,
+                rejected_attention_mask,
+            )
+
+            loss = -F.logsigmoid(chosen_score - rejected_score).mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                correct = (chosen_score > rejected_score).float().item()
+                total_correct += correct
+                total_examples += 1
+                total_loss += loss.item()
+
+            if (i + 1) % PRINT_EVERY == 0:
+                avg_loss = total_loss / total_examples
+                accuracy = total_correct / total_examples
+                print(
+                    f"epoch {epoch + 1}/{NUM_EPOCHS} "
+                    f"step {i + 1}/{len(select_sample)} "
+                    f"loss={avg_loss:.4f} accuracy={accuracy:.4f} "
+                    f"chosen_score={chosen_score.item():.4f} "
+                    f"rejected_score={rejected_score.item():.4f}"
+                )
+
+        print("Epoch average loss:", total_loss / total_examples)
+        print("Epoch training accuracy:", total_correct / total_examples)
 
 class RewardModel(nn.Module):
     def __init__(self):
@@ -154,7 +156,7 @@ class RewardModel(nn.Module):
         last_token_index = attention_mask.sum(dim=1) - 1 # last token in an example
         batch_index = torch.arange(input_ids.shape[0], device=input_ids.device) # gpu optimization step 
         final_token_hidden = last_hidden[batch_index, last_token_index] # grabs the hidden vector at the last token position
-        print(final_token_hidden.shape) # the shape will be [1,768] because the last token has 768 n_embds used to represent it
+        # print(final_token_hidden.shape) # the shape will be [1,768] because the last token has 768 n_embds used to represent it
         score = self.reward_head(final_token_hidden)
         return score
 
