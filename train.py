@@ -32,6 +32,7 @@ MODEL_NAME = "distilgpt2"
 MAX_LENGTH = 512
 LEARNING_RATE = 1e-5
 TRAIN_EXAMPLES = 500
+TEST_EXAMPLES = 500
 PRINT_EVERY = 10
 NUM_EPOCHS = 2
 
@@ -65,6 +66,15 @@ def main():
 
     select_sample = train_data.select(range(TRAIN_EXAMPLES))
     print("select sample", select_sample)
+
+    print("************************************************")
+
+    test_data = dataset["test"]
+    print("One row has these columns:", test_data.column_names)
+    print("Number of training examples:", len(test_data))
+
+    test_sample = test_data.select(range(TEST_EXAMPLES))
+    print("test sample", test_sample)
 
     reward_model = RewardModel().to(device)
     optimizer = torch.optim.AdamW(reward_model.parameters(), lr=LEARNING_RATE)
@@ -137,6 +147,60 @@ def main():
 
         print("Epoch average loss:", total_loss / total_examples)
         print("Epoch training accuracy:", total_correct / total_examples)
+
+    reward_model.eval()
+    test_loss = 0.0
+    test_correct = 0
+    test_examples = 0
+
+    # evaluation does not train the model. It only checks whether chosen_score > rejected_score
+    # on examples the reward model did not see during training.
+    with torch.no_grad():
+        for i in range(len(test_sample)):
+            example = test_sample[i]
+            chosen_tokens = tokenizer(
+                example["chosen"],
+                max_length=MAX_LENGTH,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+
+            rejected_tokens = tokenizer(
+                example["rejected"],
+                max_length=MAX_LENGTH,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+
+            # attention mask marks 1 as a real token and 0 as a padding token. Tells the model this is text and this is padding
+            # .shape represents [batch size, sequence length]
+
+            chosen_input_ids = chosen_tokens["input_ids"].to(device)
+            chosen_attention_mask = chosen_tokens["attention_mask"].to(device)
+            rejected_input_ids = rejected_tokens["input_ids"].to(device)
+            rejected_attention_mask = rejected_tokens["attention_mask"].to(device)
+
+            chosen_score = reward_model(
+                chosen_input_ids,
+                chosen_attention_mask,
+            )
+            rejected_score = reward_model(
+                rejected_input_ids,
+                rejected_attention_mask,
+            )
+
+            loss = -F.logsigmoid(chosen_score - rejected_score).mean()
+            correct = (chosen_score > rejected_score).float().item()
+
+            test_correct += correct
+            test_examples += 1
+            test_loss += loss.item()
+
+    print("Test average loss:", test_loss / test_examples)
+    print("Test accuracy:", test_correct / test_examples)
+
 
 class RewardModel(nn.Module):
     def __init__(self):
