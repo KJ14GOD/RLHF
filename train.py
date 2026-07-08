@@ -37,6 +37,7 @@ TEST_EXAMPLES = 500
 PRINT_EVERY = 10
 NUM_EPOCHS = 2
 BEST_MODEL_PATH = "best_reward_model.pt"
+POLICY_SPECIAL_TOKENS = ["<|Human|>", "<|Assistant|>"]
 
 def get_device():
     if torch.cuda.is_available():
@@ -44,6 +45,22 @@ def get_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+def format_policy_text(text):
+    return (
+        text.replace("Human:", "<|Human|>")
+        .replace("\n\nAssistant:", "\n\n<|Assistant|>")
+    )
+
+def create_policy_tokenizer():
+    tokenizer = AutoTokenizer.from_pretrained(POLICY_MODEL_NAME)
+    special_tokens = {"additional_special_tokens": POLICY_SPECIAL_TOKENS}
+    tokenizer.add_special_tokens(special_tokens)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return tokenizer
 
 def main():
     device = get_device()
@@ -81,7 +98,7 @@ def main():
     reward_model = RewardModel().to(device)
     optimizer = torch.optim.AdamW(reward_model.parameters(), lr=LEARNING_RATE)
     reward_model.train()
-    best_test_accuracy = 0.0
+    best_test_loss = float("inf")
 
     for epoch in range(NUM_EPOCHS):
         total_loss = 0.0
@@ -202,13 +219,14 @@ def main():
                 test_examples += 1
                 test_loss += loss.item()
 
+        avg_test_loss = test_loss / test_examples
         test_accuracy = test_correct / test_examples
-        print("Test average loss:", test_loss / test_examples)
+        print("Test average loss:", avg_test_loss)
         print("Test accuracy:", test_accuracy)
 
-        # Save the best reward model weights so PPO can later load the best scorer.
-        if test_accuracy > best_test_accuracy:
-            best_test_accuracy = test_accuracy
+        # Save based on the held-out preference loss; accuracy is only a diagnostic.
+        if avg_test_loss < best_test_loss:
+            best_test_loss = avg_test_loss
             torch.save(reward_model.state_dict(), BEST_MODEL_PATH)
             print("Saved new best reward model:", BEST_MODEL_PATH)
 
@@ -251,9 +269,13 @@ class RewardModel(nn.Module):
 
 
 class PolicyModel(nn.Module):
-    def __init__(self):
+    def __init__(self, tokenizer=None):
         super().__init__()
+        if tokenizer is None:
+            tokenizer = create_policy_tokenizer()
+
         self.backbone = AutoModelForCausalLM.from_pretrained(POLICY_MODEL_NAME)
+        self.backbone.resize_token_embeddings(len(tokenizer))
         hidden_size = self.backbone.config.hidden_size  # 768 for distilgpt2
 
         # The value head predicts for every token position how good the model expects the state to be
@@ -280,14 +302,12 @@ def test_policy_model():
     device = get_device()
     print("Using device:", device)
 
-    tokenizer = AutoTokenizer.from_pretrained(POLICY_MODEL_NAME)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = create_policy_tokenizer()
 
-    policy = PolicyModel().to(device)
+    policy = PolicyModel(tokenizer).to(device)
     policy.eval()
 
-    prompt = "Human: What is reinforcement learning?\n\nAssistant:"
+    prompt = format_policy_text("Human: What is reinforcement learning?\n\nAssistant:")
     tokens = tokenizer(prompt, return_tensors="pt")
     input_ids = tokens["input_ids"].to(device)
     attention_mask = tokens["attention_mask"].to(device)
