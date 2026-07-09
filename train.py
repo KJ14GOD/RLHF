@@ -38,6 +38,7 @@ PRINT_EVERY = 10
 NUM_EPOCHS = 2
 BEST_MODEL_PATH = "best_reward_model.pt"
 POLICY_SPECIAL_TOKENS = ["<|Human|>", "<|Assistant|>"]
+POLICY_PAD_TOKEN = "<|pad|>"
 
 def get_device():
     if torch.cuda.is_available():
@@ -45,22 +46,6 @@ def get_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-def format_policy_text(text):
-    return (
-        text.replace("Human:", "<|Human|>")
-        .replace("\n\nAssistant:", "\n\n<|Assistant|>")
-    )
-
-def create_policy_tokenizer():
-    tokenizer = AutoTokenizer.from_pretrained(POLICY_MODEL_NAME)
-    special_tokens = {"additional_special_tokens": POLICY_SPECIAL_TOKENS}
-    tokenizer.add_special_tokens(special_tokens)
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    return tokenizer
 
 def main():
     device = get_device()
@@ -269,19 +254,32 @@ class RewardModel(nn.Module):
 
 
 class PolicyModel(nn.Module):
-    def __init__(self, tokenizer=None):
+    def __init__(self):
         super().__init__()
-        if tokenizer is None:
-            tokenizer = create_policy_tokenizer()
-
+        self.tokenizer = self.create_tokenizer()
         self.backbone = AutoModelForCausalLM.from_pretrained(POLICY_MODEL_NAME)
-        self.backbone.resize_token_embeddings(len(tokenizer))
+        self.backbone.resize_token_embeddings(len(self.tokenizer))
         hidden_size = self.backbone.config.hidden_size  # 768 for distilgpt2
 
         # The value head predicts for every token position how good the model expects the state to be
         # PPO uses these values to compute advantages
         # maps token's hidden vector (768) to 1
         self.value_head = nn.Linear(hidden_size, 1)
+
+    def create_tokenizer(self):
+        tokenizer = AutoTokenizer.from_pretrained(POLICY_MODEL_NAME)
+        special_tokens = {
+            "additional_special_tokens": POLICY_SPECIAL_TOKENS,
+            "pad_token": POLICY_PAD_TOKEN,
+        }
+        tokenizer.add_special_tokens(special_tokens)
+        return tokenizer
+
+    def format_text(self, text):
+        return (
+            text.replace("Human:", "<|Human|>")
+            .replace("\n\nAssistant:", "\n\n<|Assistant|>")
+        )
 
     def forward(self, input_ids, attention_mask):
         outputs = self.backbone(
@@ -302,12 +300,11 @@ def test_policy_model():
     device = get_device()
     print("Using device:", device)
 
-    tokenizer = create_policy_tokenizer()
-
-    policy = PolicyModel(tokenizer).to(device)
+    policy = PolicyModel().to(device)
+    tokenizer = policy.tokenizer
     policy.eval()
 
-    prompt = format_policy_text("Human: What is reinforcement learning?\n\nAssistant:")
+    prompt = policy.format_text("Human: What is reinforcement learning?\n\nAssistant:")
     tokens = tokenizer(prompt, return_tensors="pt")
     input_ids = tokens["input_ids"].to(device)
     attention_mask = tokens["attention_mask"].to(device)
