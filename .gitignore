@@ -1,0 +1,14 @@
+__pycache__/
+.venv/
+
+# Python cache/test artifacts
+*.py[cod]
+.pytest_cache/
+
+# Local datasets, caches, and model outputs
+.model/
+.cache/
+.uv-cache/
+*.pt
+*.pth
+*.ckpt
