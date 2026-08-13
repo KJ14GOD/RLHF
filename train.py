@@ -21,6 +21,10 @@
 # ppo update
 
 
+import argparse
+import copy
+import os
+
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 from datasets import load_dataset
 import torch
@@ -37,8 +41,20 @@ TEST_EXAMPLES = 500
 PRINT_EVERY = 10
 NUM_EPOCHS = 2
 BEST_MODEL_PATH = "best_reward_model.pt"
+PPO_MODEL_PATH = "ppo_policy_model.pt"
 POLICY_SPECIAL_TOKENS = ["<|Human|>", "<|Assistant|>"]
 POLICY_PAD_TOKEN = "<|pad|>"
+PPO_LEARNING_RATE = 1e-6
+PPO_CLIP_RANGE = 0.2
+VALUE_CLIP_RANGE = 0.2
+VALUE_LOSS_COEF = 0.5
+ENTROPY_COEF = 0.01
+KL_COEF = 0.05
+GAMMA = 1.0
+GAE_LAMBDA = 0.95
+MAX_GRAD_NORM = 1.0
+MAX_NEW_TOKENS = 64
+PPO_EPOCHS = 4
 
 def get_device():
     if torch.cuda.is_available():
@@ -47,7 +63,7 @@ def get_device():
         return torch.device("mps")
     return torch.device("cpu")
 
-def main():
+def train_reward_model():
     device = get_device()
     print("Using device:", device)
 
@@ -86,6 +102,7 @@ def main():
     best_test_loss = float("inf")
 
     for epoch in range(NUM_EPOCHS):
+        reward_model.train()
         total_loss = 0.0
         total_correct = 0
         total_examples = 0
@@ -296,6 +313,272 @@ class PolicyModel(nn.Module):
         return logits, values
 
 
+def get_answer_stats(logits, values, input_ids, prompt_length):
+    # Token j is predicted by the logits/value at position j - 1.
+    answer_ids = input_ids[:, prompt_length:]
+    prediction_logits = logits[:, prompt_length - 1:-1, :]
+    answer_values = values[:, prompt_length - 1:-1]
+    answer_log_probs = F.log_softmax(prediction_logits, dim=-1).gather(
+        dim=-1,
+        index=answer_ids.unsqueeze(-1),
+    ).squeeze(-1)
+    entropy = torch.distributions.Categorical(logits=prediction_logits).entropy()
+    return answer_log_probs, answer_values, entropy
+
+
+def generate_rollout(policy, prompt, max_new_tokens=MAX_NEW_TOKENS, temperature=1.0):
+    tokenizer = policy.tokenizer
+    device = next(policy.parameters()).device
+
+    formatted_prompt = policy.format_text(prompt)
+    tokens = tokenizer(formatted_prompt, return_tensors="pt")
+    input_ids = tokens["input_ids"].to(device)
+    attention_mask = tokens["attention_mask"].to(device)
+
+    prompt_length = input_ids.shape[1]
+    policy.eval()
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            logits, _ = policy(input_ids, attention_mask)
+            final_logits = logits[:, -1, :] / temperature
+            next_token_id = torch.distributions.Categorical(logits=final_logits).sample()
+            next_token_id = next_token_id.unsqueeze(-1)
+
+            # Add the selected token to the sequence.
+            input_ids = torch.cat([input_ids, next_token_id], dim=1)
+
+            # The generated token is real text, so its mask value is 1.
+            attention_mask = torch.cat([attention_mask, torch.ones_like(next_token_id)] , dim=1,)
+
+            if next_token_id.item() == tokenizer.eos_token_id:
+                break
+
+    generated_ids = input_ids[:, prompt_length:]
+    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+
+    with torch.no_grad():
+        logits, values = policy(input_ids, attention_mask)
+        old_log_probs, old_values, _ = get_answer_stats(
+            logits,
+            values,
+            input_ids,
+            prompt_length,
+        )
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "prompt_length": prompt_length,
+        "generated_ids": generated_ids,
+        "generated_text": generated_text,
+        "old_log_probs": old_log_probs,
+        "old_values": old_values,
+    }
+
+
+def create_reference_model(policy):
+    reference_model = copy.deepcopy(policy.backbone)
+    reference_model.eval()
+    for parameter in reference_model.parameters():
+        parameter.requires_grad = False
+    return reference_model
+
+
+def get_reference_log_probs(reference_model, rollout):
+    with torch.no_grad():
+        outputs = reference_model(
+            input_ids=rollout["input_ids"],
+            attention_mask=rollout["attention_mask"],
+        )
+        answer_ids = rollout["generated_ids"]
+        prediction_logits = outputs.logits[:, rollout["prompt_length"] - 1:-1, :]
+        return F.log_softmax(prediction_logits, dim=-1).gather(
+            dim=-1,
+            index=answer_ids.unsqueeze(-1),
+        ).squeeze(-1)
+
+
+def load_reward_model(device):
+    if not os.path.exists(BEST_MODEL_PATH):
+        raise FileNotFoundError(
+            f"{BEST_MODEL_PATH} was not found. Run `uv run python train.py reward` first."
+        )
+
+    reward_model = RewardModel().to(device)
+    state_dict = torch.load(BEST_MODEL_PATH, map_location=device, weights_only=True)
+    reward_model.load_state_dict(state_dict)
+    reward_model.eval()
+    for parameter in reward_model.parameters():
+        parameter.requires_grad = False
+    return reward_model
+
+
+def score_response(reward_model, reward_tokenizer, prompt, generated_text):
+    device = next(reward_model.parameters()).device
+    text = prompt + generated_text
+    tokens = reward_tokenizer(
+        text,
+        max_length=MAX_LENGTH,
+        truncation=True,
+        padding=True,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        score = reward_model(
+            tokens["input_ids"].to(device),
+            tokens["attention_mask"].to(device),
+        )
+    return score.squeeze()
+
+
+def compute_advantages(old_values, token_rewards):
+    advantages = torch.zeros_like(token_rewards)
+    last_advantage = torch.zeros(
+        token_rewards.shape[0],
+        device=token_rewards.device,
+    )
+
+    for token_index in reversed(range(token_rewards.shape[1])):
+        if token_index == token_rewards.shape[1] - 1:
+            next_value = torch.zeros_like(last_advantage)
+        else:
+            next_value = old_values[:, token_index + 1]
+
+        delta = (
+            token_rewards[:, token_index]
+            + GAMMA * next_value
+            - old_values[:, token_index]
+        )
+        last_advantage = delta + GAMMA * GAE_LAMBDA * last_advantage
+        advantages[:, token_index] = last_advantage
+
+    returns = advantages + old_values
+    if advantages.numel() > 1:
+        advantages = (advantages - advantages.mean()) / (
+            advantages.std(unbiased=False) + 1e-8
+        )
+    return advantages, returns
+
+
+def ppo_update(policy, optimizer, rollout, advantages, returns):
+    old_log_probs = rollout["old_log_probs"]
+    old_values = rollout["old_values"]
+    metrics = {}
+    policy.train()
+
+    for _ in range(PPO_EPOCHS):
+        logits, values = policy(rollout["input_ids"], rollout["attention_mask"])
+        log_probs, current_values, entropy = get_answer_stats(
+            logits,
+            values,
+            rollout["input_ids"],
+            rollout["prompt_length"],
+        )
+
+        ratio = torch.exp(log_probs - old_log_probs)
+        unclipped_objective = ratio * advantages
+        clipped_objective = torch.clamp(
+            ratio,
+            1.0 - PPO_CLIP_RANGE,
+            1.0 + PPO_CLIP_RANGE,
+        ) * advantages
+        policy_loss = -torch.min(unclipped_objective, clipped_objective).mean()
+
+        clipped_values = old_values + torch.clamp(
+            current_values - old_values,
+            -VALUE_CLIP_RANGE,
+            VALUE_CLIP_RANGE,
+        )
+        value_loss = 0.5 * torch.max(
+            (current_values - returns).pow(2),
+            (clipped_values - returns).pow(2),
+        ).mean()
+        entropy_bonus = entropy.mean()
+        loss = (
+            policy_loss
+            + VALUE_LOSS_COEF * value_loss
+            - ENTROPY_COEF * entropy_bonus
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
+        optimizer.step()
+
+        with torch.no_grad():
+            metrics = {
+                "loss": loss.item(),
+                "policy_loss": policy_loss.item(),
+                "value_loss": value_loss.item(),
+                "entropy": entropy_bonus.item(),
+                "clip_fraction": ((ratio - 1.0).abs() > PPO_CLIP_RANGE).float().mean().item(),
+            }
+
+    return metrics
+
+
+def train_ppo(prompts, num_steps=10):
+    device = get_device()
+    print("Using device:", device)
+    reward_model = load_reward_model(device)
+    policy = PolicyModel().to(device)
+    reference_model = create_reference_model(policy)
+    reward_tokenizer = AutoTokenizer.from_pretrained(REWARD_MODEL_NAME)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=PPO_LEARNING_RATE)
+
+    for step in range(num_steps):
+        prompt = prompts[step % len(prompts)]
+        rollout = generate_rollout(policy, prompt)
+        reference_log_probs = get_reference_log_probs(reference_model, rollout)
+        reward_score = score_response(
+            reward_model,
+            reward_tokenizer,
+            prompt,
+            rollout["generated_text"],
+        )
+
+        with torch.no_grad():
+            log_ratio = rollout["old_log_probs"] - reference_log_probs
+            token_rewards = -KL_COEF * log_ratio
+            token_rewards[:, -1] += reward_score
+            advantages, returns = compute_advantages(
+                rollout["old_values"],
+                token_rewards,
+            )
+
+        metrics = ppo_update(policy, optimizer, rollout, advantages, returns)
+        print(
+            f"step={step + 1}/{num_steps} "
+            f"reward={reward_score.item():.4f} "
+            f"kl={log_ratio.mean().item():.4f} "
+            f"loss={metrics['loss']:.4f} "
+            f"generated={rollout['generated_text']!r}"
+        )
+
+    torch.save(policy.state_dict(), PPO_MODEL_PATH)
+    print("Saved PPO policy:", PPO_MODEL_PATH)
+    return policy
+
+
+def test_generate_rollout():
+    device = get_device()
+    policy = PolicyModel().to(device)
+
+    rollout = generate_rollout(
+        policy,
+        "Human: What is reinforcement learning?\n\nAssistant:",
+    )
+
+    print("Prompt length:", rollout["prompt_length"])
+    print("Full sequence shape:", rollout["input_ids"].shape)
+    print("Generated token IDs:", rollout["generated_ids"])
+    print("Generated text:", rollout["generated_text"])
+    print("Answer log probs shape:", rollout["old_log_probs"].shape)
+    print("Answer values shape:", rollout["old_values"].shape)
+
+
+
 def test_policy_model():
     device = get_device()
     print("Using device:", device)
@@ -317,5 +600,32 @@ def test_policy_model():
     print("values shape:   ",(values.shape))      # [1, seq_len]
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train and test the RLHF PPO pipeline.")
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=("rollout", "policy", "reward", "ppo"),
+        default="rollout",
+    )
+    parser.add_argument("--ppo-steps", type=int, default=10)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    test_policy_model()
+    args = parse_args()
+    if args.mode == "reward":
+        train_reward_model()
+    elif args.mode == "ppo":
+        train_ppo(
+            prompts=[
+                "Human: What is reinforcement learning?\n\nAssistant:",
+                "Human: Explain gradient descent simply.\n\nAssistant:",
+                "Human: What makes an answer helpful?\n\nAssistant:",
+            ],
+            num_steps=args.ppo_steps,
+        )
+    elif args.mode == "policy":
+        test_policy_model()
+    else:
+        test_generate_rollout()
