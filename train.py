@@ -55,6 +55,7 @@ GAE_LAMBDA = 0.95
 MAX_GRAD_NORM = 1.0
 MAX_NEW_TOKENS = 64
 PPO_EPOCHS = 4
+ROLLOUTS_PER_STEP = 8
 
 def get_device():
     if torch.cuda.is_available():
@@ -454,66 +455,91 @@ def compute_advantages(old_values, token_rewards):
         advantages[:, token_index] = last_advantage
 
     returns = advantages + old_values
-    if advantages.numel() > 1:
-        advantages = (advantages - advantages.mean()) / (
-            advantages.std(unbiased=False) + 1e-8
-        )
     return advantages, returns
 
 
-def ppo_update(policy, optimizer, rollout, advantages, returns):
-    old_log_probs = rollout["old_log_probs"]
-    old_values = rollout["old_values"]
+def normalize_advantages(rollouts):
+    # Whitening one rollout at a time would force each response's mean advantage
+    # to zero, erasing the sequence-level signal that a whole response scored
+    # well or badly. Normalizing across the batch keeps that signal.
+    all_advantages = torch.cat(
+        [rollout["advantages"].flatten() for rollout in rollouts]
+    )
+    if all_advantages.numel() > 1:
+        mean = all_advantages.mean()
+        std = all_advantages.std(unbiased=False)
+        for rollout in rollouts:
+            rollout["advantages"] = (rollout["advantages"] - mean) / (std + 1e-8)
+
+
+def ppo_update(policy, optimizer, rollouts):
     metrics = {}
-    policy.train()
+    # Stay in eval mode: the old log probs were computed with dropout off, so
+    # updating with dropout on would make ratios differ from 1 before any
+    # weight change, causing spurious clipping. Gradients still flow in eval.
+    policy.eval()
 
     for _ in range(PPO_EPOCHS):
-        logits, values = policy(rollout["input_ids"], rollout["attention_mask"])
-        log_probs, current_values, entropy = get_answer_stats(
-            logits,
-            values,
-            rollout["input_ids"],
-            rollout["prompt_length"],
-        )
-
-        ratio = torch.exp(log_probs - old_log_probs)
-        unclipped_objective = ratio * advantages
-        clipped_objective = torch.clamp(
-            ratio,
-            1.0 - PPO_CLIP_RANGE,
-            1.0 + PPO_CLIP_RANGE,
-        ) * advantages
-        policy_loss = -torch.min(unclipped_objective, clipped_objective).mean()
-
-        clipped_values = old_values + torch.clamp(
-            current_values - old_values,
-            -VALUE_CLIP_RANGE,
-            VALUE_CLIP_RANGE,
-        )
-        value_loss = 0.5 * torch.max(
-            (current_values - returns).pow(2),
-            (clipped_values - returns).pow(2),
-        ).mean()
-        entropy_bonus = entropy.mean()
-        loss = (
-            policy_loss
-            + VALUE_LOSS_COEF * value_loss
-            - ENTROPY_COEF * entropy_bonus
-        )
-
+        totals = {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "entropy": 0.0,
+            "clip_fraction": 0.0,
+        }
         optimizer.zero_grad()
-        loss.backward()
+
+        for rollout in rollouts:
+            logits, values = policy(rollout["input_ids"], rollout["attention_mask"])
+            log_probs, current_values, entropy = get_answer_stats(
+                logits,
+                values,
+                rollout["input_ids"],
+                rollout["prompt_length"],
+            )
+
+            advantages = rollout["advantages"]
+            ratio = torch.exp(log_probs - rollout["old_log_probs"])
+            unclipped_objective = ratio * advantages
+            clipped_objective = torch.clamp(
+                ratio,
+                1.0 - PPO_CLIP_RANGE,
+                1.0 + PPO_CLIP_RANGE,
+            ) * advantages
+            policy_loss = -torch.min(unclipped_objective, clipped_objective).mean()
+
+            old_values = rollout["old_values"]
+            clipped_values = old_values + torch.clamp(
+                current_values - old_values,
+                -VALUE_CLIP_RANGE,
+                VALUE_CLIP_RANGE,
+            )
+            value_loss = 0.5 * torch.max(
+                (current_values - rollout["returns"]).pow(2),
+                (clipped_values - rollout["returns"]).pow(2),
+            ).mean()
+            entropy_bonus = entropy.mean()
+            loss = (
+                policy_loss
+                + VALUE_LOSS_COEF * value_loss
+                - ENTROPY_COEF * entropy_bonus
+            )
+
+            # One optimizer step per epoch: each rollout contributes
+            # loss / batch size so gradients average over the batch.
+            (loss / len(rollouts)).backward()
+
+            totals["loss"] += loss.item()
+            totals["policy_loss"] += policy_loss.item()
+            totals["value_loss"] += value_loss.item()
+            totals["entropy"] += entropy_bonus.item()
+            totals["clip_fraction"] += (
+                ((ratio - 1.0).abs() > PPO_CLIP_RANGE).float().mean().item()
+            )
+
         torch.nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
         optimizer.step()
-
-        with torch.no_grad():
-            metrics = {
-                "loss": loss.item(),
-                "policy_loss": policy_loss.item(),
-                "value_loss": value_loss.item(),
-                "entropy": entropy_bonus.item(),
-                "clip_fraction": ((ratio - 1.0).abs() > PPO_CLIP_RANGE).float().mean().item(),
-            }
+        metrics = {name: total / len(rollouts) for name, total in totals.items()}
 
     return metrics
 
@@ -528,32 +554,46 @@ def train_ppo(prompts, num_steps=10):
     optimizer = torch.optim.AdamW(policy.parameters(), lr=PPO_LEARNING_RATE)
 
     for step in range(num_steps):
-        prompt = prompts[step % len(prompts)]
-        rollout = generate_rollout(policy, prompt)
-        reference_log_probs = get_reference_log_probs(reference_model, rollout)
-        reward_score = score_response(
-            reward_model,
-            reward_tokenizer,
-            prompt,
-            rollout["generated_text"],
-        )
-
-        with torch.no_grad():
-            log_ratio = rollout["old_log_probs"] - reference_log_probs
-            token_rewards = -KL_COEF * log_ratio
-            token_rewards[:, -1] += reward_score
-            advantages, returns = compute_advantages(
-                rollout["old_values"],
-                token_rewards,
+        rollouts = []
+        for rollout_index in range(ROLLOUTS_PER_STEP):
+            prompt = prompts[
+                (step * ROLLOUTS_PER_STEP + rollout_index) % len(prompts)
+            ]
+            rollout = generate_rollout(policy, prompt)
+            reference_log_probs = get_reference_log_probs(reference_model, rollout)
+            reward_score = score_response(
+                reward_model,
+                reward_tokenizer,
+                prompt,
+                rollout["generated_text"],
             )
 
-        metrics = ppo_update(policy, optimizer, rollout, advantages, returns)
+            with torch.no_grad():
+                log_ratio = rollout["old_log_probs"] - reference_log_probs
+                token_rewards = -KL_COEF * log_ratio
+                token_rewards[:, -1] += reward_score
+                advantages, returns = compute_advantages(
+                    rollout["old_values"],
+                    token_rewards,
+                )
+
+            rollout["advantages"] = advantages
+            rollout["returns"] = returns
+            rollout["reward_score"] = reward_score.item()
+            rollout["kl"] = log_ratio.mean().item()
+            rollouts.append(rollout)
+
+        normalize_advantages(rollouts)
+        metrics = ppo_update(policy, optimizer, rollouts)
+
+        mean_reward = sum(r["reward_score"] for r in rollouts) / len(rollouts)
+        mean_kl = sum(r["kl"] for r in rollouts) / len(rollouts)
         print(
             f"step={step + 1}/{num_steps} "
-            f"reward={reward_score.item():.4f} "
-            f"kl={log_ratio.mean().item():.4f} "
+            f"reward={mean_reward:.4f} "
+            f"kl={mean_kl:.4f} "
             f"loss={metrics['loss']:.4f} "
-            f"generated={rollout['generated_text']!r}"
+            f"sample={rollouts[0]['generated_text']!r}"
         )
 
     torch.save(policy.state_dict(), PPO_MODEL_PATH)
