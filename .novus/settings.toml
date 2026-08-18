@@ -1,2 +1,9 @@
-[run]
+# Novus workspace configuration — committed, shared, reviewed with the code.
+# It says how to install, run, and verify this project. Never put a secret
+# value here: name the variable under `secretNames` and supply the value on
+# the machine that has it.
+
+[[run]]
+name = "serve"
 command = "python3 -m http.server 8123 --bind 127.0.0.1"
+port = 8123
