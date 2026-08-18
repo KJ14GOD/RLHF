@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RLHF PPO Playground</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 640px;
+      margin: 4rem auto;
+      padding: 0 1rem;
+      color: #1a1a1a;
+      line-height: 1.6;
+    }
+    h1 { font-size: 1.6rem; }
+    code {
+      background: #f2f2f2;
+      padding: 0.15rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+    ol { padding-left: 1.2rem; }
+  </style>
+</head>
+<body>
+  <h1>RLHF PPO Playground</h1>
+  <p>
+    A from-scratch RLHF pipeline: a BERT reward model trained on
+    Anthropic&rsquo;s hh-rlhf preferences, plus a distilgpt2 policy
+    fine-tuned with PPO (GAE, KL-penalized rewards, clipped objectives).
+  </p>
+  <ol>
+    <li><code>uv run python train.py reward</code> &mdash; train the reward model</li>
+    <li><code>uv run python train.py rollout</code> &mdash; sanity-check generation</li>
+    <li><code>uv run python train.py ppo</code> &mdash; run PPO training</li>
+  </ol>
+  <p>Served locally via <code>python3 -m http.server 8123</code>.</p>
+</body>
+</html>
