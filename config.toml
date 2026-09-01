@@ -10,6 +10,7 @@ max_length = 512
 learning_rate = 1e-5
 train_examples = 500
 test_examples = 500
+batch_size = 8
 print_every = 10
 num_epochs = 2
 best_model_path = "best_reward_model.pt"

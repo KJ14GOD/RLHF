@@ -25,14 +25,16 @@ import argparse
 import copy
 import os
 
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+from transformers import AutoTokenizer
 from datasets import load_dataset
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 # All tunable values now live in config.toml; CONFIG exposes them as attributes.
 from config import CONFIG
+from data import PreferenceDataset, make_preference_collate
+from models import PolicyModel, RewardModel
 
 def get_device():
     if torch.cuda.is_available():
@@ -48,35 +50,35 @@ def train_reward_model():
     dataset = load_dataset("Anthropic/hh-rlhf", data_dir="helpful-base")
     tokenizer = AutoTokenizer.from_pretrained(CONFIG.REWARD_MODEL_NAME)
     tokenizer.truncation_side = "left"
-    
-    # For batching, we reuse the end-of-text token as padding.
 
+    # For batching, we reuse the end-of-text token as padding.
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(dataset)
     print("Available splits:", dataset.keys())
-    print("Tokenizer truncation side:", tokenizer.truncation_side)
+    train_sample = dataset["train"].select(range(CONFIG.TRAIN_EXAMPLES))
+    test_sample = dataset["test"].select(range(CONFIG.TEST_EXAMPLES))
+    print("Number of training examples:", len(train_sample))
+    print("Number of test examples:", len(test_sample))
 
-    train_data = dataset["train"]
-    print("One row has these columns:", train_data.column_names)
-    print("Number of training examples:", len(train_data))
-
-    select_sample = train_data.select(range(CONFIG.TRAIN_EXAMPLES))
-    print("select sample", select_sample)
-
-    print("************************************************")
-
-    test_data = dataset["test"]
-    print("One row has these columns:", test_data.column_names)
-    print("Number of training examples:", len(test_data))
-
-    test_sample = test_data.select(range(CONFIG.TEST_EXAMPLES))
-    print("test sample", test_sample)
+    # The Dataset yields chosen/rejected text pairs; the DataLoader batches and
+    # shuffles them, and the collate function tokenizes each batch.
+    collate = make_preference_collate(tokenizer, CONFIG.MAX_LENGTH)
+    train_loader = DataLoader(
+        PreferenceDataset(train_sample),
+        batch_size=CONFIG.BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate,
+    )
+    test_loader = DataLoader(
+        PreferenceDataset(test_sample),
+        batch_size=CONFIG.BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate,
+    )
 
     reward_model = RewardModel().to(device)
     optimizer = torch.optim.AdamW(reward_model.parameters(), lr=CONFIG.LEARNING_RATE)
-    reward_model.train()
     best_test_loss = float("inf")
 
     for epoch in range(CONFIG.NUM_EPOCHS):
@@ -87,39 +89,14 @@ def train_reward_model():
 
         print(f"\nStarting epoch {epoch + 1}/{CONFIG.NUM_EPOCHS}")
 
-        for i in range(len(select_sample)):
-            example = select_sample[i]
-            chosen_tokens = tokenizer(
-                example["chosen"],
-                max_length=CONFIG.MAX_LENGTH,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-
-            rejected_tokens = tokenizer(
-                example["rejected"],
-                max_length=CONFIG.MAX_LENGTH,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-
-            # attention mask marks 1 as a real token and 0 as a padding token. Tells the model this is text and this is padding
-            # .shape represents [batch size, sequence length] 
-
-            chosen_input_ids = chosen_tokens["input_ids"].to(device)
-            chosen_attention_mask = chosen_tokens["attention_mask"].to(device)
-            rejected_input_ids = rejected_tokens["input_ids"].to(device)
-            rejected_attention_mask = rejected_tokens["attention_mask"].to(device)
-
+        for batch_index, batch in enumerate(train_loader):
             chosen_score = reward_model(
-                chosen_input_ids,
-                chosen_attention_mask,
+                batch["chosen_input_ids"].to(device),
+                batch["chosen_attention_mask"].to(device),
             )
             rejected_score = reward_model(
-                rejected_input_ids,
-                rejected_attention_mask,
+                batch["rejected_input_ids"].to(device),
+                batch["rejected_attention_mask"].to(device),
             )
 
             loss = -F.logsigmoid(chosen_score - rejected_score).mean()
@@ -129,20 +106,19 @@ def train_reward_model():
             optimizer.step()
 
             with torch.no_grad():
-                correct = (chosen_score > rejected_score).float().item()
-                total_correct += correct
-                total_examples += 1
-                total_loss += loss.item()
+                batch_examples = chosen_score.shape[0]
+                total_correct += (chosen_score > rejected_score).float().sum().item()
+                total_examples += batch_examples
+                total_loss += loss.item() * batch_examples
 
-            if (i + 1) % CONFIG.PRINT_EVERY == 0:
-                avg_loss = total_loss / total_examples
-                accuracy = total_correct / total_examples
+            if (batch_index + 1) % CONFIG.PRINT_EVERY == 0:
                 print(
                     f"epoch {epoch + 1}/{CONFIG.NUM_EPOCHS} "
-                    f"step {i + 1}/{len(select_sample)} "
-                    f"loss={avg_loss:.4f} accuracy={accuracy:.4f} "
-                    f"chosen_score={chosen_score.item():.4f} "
-                    f"rejected_score={rejected_score.item():.4f}"
+                    f"batch {batch_index + 1}/{len(train_loader)} "
+                    f"loss={total_loss / total_examples:.4f} "
+                    f"accuracy={total_correct / total_examples:.4f} "
+                    f"chosen_score={chosen_score.mean().item():.4f} "
+                    f"rejected_score={rejected_score.mean().item():.4f}"
                 )
 
         print("Epoch average loss:", total_loss / total_examples)
@@ -157,47 +133,22 @@ def train_reward_model():
         # on examples the reward model did not see during training.
 
         with torch.no_grad():
-            for i in range(len(test_sample)):
-                example = test_sample[i]
-                chosen_tokens = tokenizer(
-                    example["chosen"],
-                    max_length=CONFIG.MAX_LENGTH,
-                    truncation=True,
-                    padding="max_length",
-                    return_tensors="pt",
-                )
-
-                rejected_tokens = tokenizer(
-                    example["rejected"],
-                    max_length=CONFIG.MAX_LENGTH,
-                    truncation=True,
-                    padding="max_length",
-                    return_tensors="pt",
-                )
-
-                # attention mask marks 1 as a real token and 0 as a padding token. Tells the model this is text and this is padding
-                # .shape represents [batch size, sequence length]
-
-                chosen_input_ids = chosen_tokens["input_ids"].to(device)
-                chosen_attention_mask = chosen_tokens["attention_mask"].to(device)
-                rejected_input_ids = rejected_tokens["input_ids"].to(device)
-                rejected_attention_mask = rejected_tokens["attention_mask"].to(device)
-
+            for batch in test_loader:
                 chosen_score = reward_model(
-                    chosen_input_ids,
-                    chosen_attention_mask,
+                    batch["chosen_input_ids"].to(device),
+                    batch["chosen_attention_mask"].to(device),
                 )
                 rejected_score = reward_model(
-                    rejected_input_ids,
-                    rejected_attention_mask,
+                    batch["rejected_input_ids"].to(device),
+                    batch["rejected_attention_mask"].to(device),
                 )
 
                 loss = -F.logsigmoid(chosen_score - rejected_score).mean()
-                correct = (chosen_score > rejected_score).float().item()
 
-                test_correct += correct
-                test_examples += 1
-                test_loss += loss.item()
+                batch_examples = chosen_score.shape[0]
+                test_correct += (chosen_score > rejected_score).float().sum().item()
+                test_examples += batch_examples
+                test_loss += loss.item() * batch_examples
 
         avg_test_loss = test_loss / test_examples
         test_accuracy = test_correct / test_examples
@@ -209,86 +160,6 @@ def train_reward_model():
             best_test_loss = avg_test_loss
             torch.save(reward_model.state_dict(), CONFIG.BEST_MODEL_PATH)
             print("Saved new best reward model:", CONFIG.BEST_MODEL_PATH)
-
-        reward_model.eval()
-
-
-
-class RewardModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = AutoModel.from_pretrained(CONFIG.REWARD_MODEL_NAME)
-        hidden_size = self.backbone.config.hidden_size
-        self.reward_head = nn.Linear(hidden_size, 1) # in our case it will be 768 
-
-    def forward(self, input_ids, attention_mask):
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-
-        # # get the last hidden state which represents the value
-        # last_hidden = outputs.hidden_states[-1] # last_hidden.shape is [1, 512, 768]. 1 example in each batch, 512 tokens for each example and 768 numbers for each token
-        # last_token_index = attention_mask.sum(dim=1) - 1 # last token in an example
-        # batch_index = torch.arange(input_ids.shape[0], device=input_ids.device) # gpu optimization step 
-        # final_token_hidden = last_hidden[batch_index, last_token_index] # grabs the hidden vector at the last token position
-        # # print(final_token_hidden.shape) # the shape will be [1,768] because the last token has 768 n_embds used to represent it
-        # score = self.reward_head(final_token_hidden)
-
-
-        # BERT is an encoder model. It reads the full sequence bidirectionally.
-        # pooler_output is one vector for the whole sequence, based on the [CLS] token.
-        pooled_output = outputs.pooler_output # pooled_output.shape is [batch size, 768] for bert-base
-        score = self.reward_head(pooled_output)
-        return score
-
-# 1. Pass tokens through BERT encoder backbone
-# 2. Get pooler_output, which is one vector for the whole sequence
-# 3. Pass that pooled vector through a linear layer
-# 4. Output one number
-
-
-class PolicyModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.tokenizer = self.create_tokenizer()
-        self.backbone = AutoModelForCausalLM.from_pretrained(CONFIG.POLICY_MODEL_NAME)
-        self.backbone.resize_token_embeddings(len(self.tokenizer))
-        hidden_size = self.backbone.config.hidden_size  # 768 for distilgpt2
-
-        # The value head predicts for every token position how good the model expects the state to be
-        # PPO uses these values to compute advantages
-        # maps token's hidden vector (768) to 1
-        self.value_head = nn.Linear(hidden_size, 1)
-
-    def create_tokenizer(self):
-        tokenizer = AutoTokenizer.from_pretrained(CONFIG.POLICY_MODEL_NAME)
-        special_tokens = {
-            "additional_special_tokens": CONFIG.POLICY_SPECIAL_TOKENS,
-            "pad_token": CONFIG.POLICY_PAD_TOKEN,
-        }
-        tokenizer.add_special_tokens(special_tokens)
-        return tokenizer
-
-    def format_text(self, text):
-        return (
-            text.replace("Human:", "<|Human|>")
-            .replace("\n\nAssistant:", "\n\n<|Assistant|>")
-        )
-
-    def forward(self, input_ids, attention_mask):
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-
-        # logits: what token should come next at each position. shape is [batch, seq_len, vocab_size] vocab_size represents the total number of unique building blocks that the model's tokenizer can read
-        logits = outputs.logits # score for every possible token in distilgpt2
-        last_hidden = outputs.hidden_states[-1] # last_hidden is the final layer's hidden state for every token. shape is [batch, seq_len, hidden_size]
-        values = self.value_head(last_hidden).squeeze(-1) # squeeze the trailing 1. shape is [batch,seq_len]
-
-        return logits, values
 
 
 def get_answer_stats(logits, values, input_ids, prompt_length):
