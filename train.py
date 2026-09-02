@@ -25,37 +25,16 @@ import argparse
 import copy
 import os
 
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+from transformers import AutoTokenizer
 from datasets import load_dataset
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
-#modify token length based on gpu
-REWARD_MODEL_NAME = "google-bert/bert-base-cased"
-POLICY_MODEL_NAME = "distilgpt2"
-MAX_LENGTH = 512
-LEARNING_RATE = 1e-5
-TRAIN_EXAMPLES = 500
-TEST_EXAMPLES = 500
-PRINT_EVERY = 10
-NUM_EPOCHS = 2
-BEST_MODEL_PATH = "best_reward_model.pt"
-PPO_MODEL_PATH = "ppo_policy_model.pt"
-POLICY_SPECIAL_TOKENS = ["<|Human|>", "<|Assistant|>"]
-POLICY_PAD_TOKEN = "<|pad|>"
-PPO_LEARNING_RATE = 1e-6
-PPO_CLIP_RANGE = 0.2
-VALUE_CLIP_RANGE = 0.2
-VALUE_LOSS_COEF = 0.5
-ENTROPY_COEF = 0.01
-KL_COEF = 0.05
-GAMMA = 1.0
-GAE_LAMBDA = 0.95
-MAX_GRAD_NORM = 1.0
-MAX_NEW_TOKENS = 64
-PPO_EPOCHS = 4
-ROLLOUTS_PER_STEP = 8
+# All tunable values now live in config.toml; CONFIG exposes them as attributes.
+from config import CONFIG
+from data import PreferenceDataset, make_preference_collate
+from models import PolicyModel, RewardModel
 
 def get_device():
     if torch.cuda.is_available():
@@ -69,80 +48,55 @@ def train_reward_model():
     print("Using device:", device)
 
     dataset = load_dataset("Anthropic/hh-rlhf", data_dir="helpful-base")
-    tokenizer = AutoTokenizer.from_pretrained(REWARD_MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(CONFIG.REWARD_MODEL_NAME)
     tokenizer.truncation_side = "left"
-    
-    # For batching, we reuse the end-of-text token as padding.
 
+    # For batching, we reuse the end-of-text token as padding.
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(dataset)
     print("Available splits:", dataset.keys())
-    print("Tokenizer truncation side:", tokenizer.truncation_side)
+    train_sample = dataset["train"].select(range(CONFIG.TRAIN_EXAMPLES))
+    test_sample = dataset["test"].select(range(CONFIG.TEST_EXAMPLES))
+    print("Number of training examples:", len(train_sample))
+    print("Number of test examples:", len(test_sample))
 
-    train_data = dataset["train"]
-    print("One row has these columns:", train_data.column_names)
-    print("Number of training examples:", len(train_data))
-
-    select_sample = train_data.select(range(TRAIN_EXAMPLES))
-    print("select sample", select_sample)
-
-    print("************************************************")
-
-    test_data = dataset["test"]
-    print("One row has these columns:", test_data.column_names)
-    print("Number of training examples:", len(test_data))
-
-    test_sample = test_data.select(range(TEST_EXAMPLES))
-    print("test sample", test_sample)
+    # The Dataset yields chosen/rejected text pairs; the DataLoader batches and
+    # shuffles them, and the collate function tokenizes each batch.
+    collate = make_preference_collate(tokenizer, CONFIG.MAX_LENGTH)
+    train_loader = DataLoader(
+        PreferenceDataset(train_sample),
+        batch_size=CONFIG.BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate,
+    )
+    test_loader = DataLoader(
+        PreferenceDataset(test_sample),
+        batch_size=CONFIG.BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate,
+    )
 
     reward_model = RewardModel().to(device)
-    optimizer = torch.optim.AdamW(reward_model.parameters(), lr=LEARNING_RATE)
-    reward_model.train()
+    optimizer = torch.optim.AdamW(reward_model.parameters(), lr=CONFIG.LEARNING_RATE)
     best_test_loss = float("inf")
 
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(CONFIG.NUM_EPOCHS):
         reward_model.train()
         total_loss = 0.0
         total_correct = 0
         total_examples = 0
 
-        print(f"\nStarting epoch {epoch + 1}/{NUM_EPOCHS}")
+        print(f"\nStarting epoch {epoch + 1}/{CONFIG.NUM_EPOCHS}")
 
-        for i in range(len(select_sample)):
-            example = select_sample[i]
-            chosen_tokens = tokenizer(
-                example["chosen"],
-                max_length=MAX_LENGTH,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-
-            rejected_tokens = tokenizer(
-                example["rejected"],
-                max_length=MAX_LENGTH,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-
-            # attention mask marks 1 as a real token and 0 as a padding token. Tells the model this is text and this is padding
-            # .shape represents [batch size, sequence length] 
-
-            chosen_input_ids = chosen_tokens["input_ids"].to(device)
-            chosen_attention_mask = chosen_tokens["attention_mask"].to(device)
-            rejected_input_ids = rejected_tokens["input_ids"].to(device)
-            rejected_attention_mask = rejected_tokens["attention_mask"].to(device)
-
+        for batch_index, batch in enumerate(train_loader):
             chosen_score = reward_model(
-                chosen_input_ids,
-                chosen_attention_mask,
+                batch["chosen_input_ids"].to(device),
+                batch["chosen_attention_mask"].to(device),
             )
             rejected_score = reward_model(
-                rejected_input_ids,
-                rejected_attention_mask,
+                batch["rejected_input_ids"].to(device),
+                batch["rejected_attention_mask"].to(device),
             )
 
             loss = -F.logsigmoid(chosen_score - rejected_score).mean()
@@ -152,20 +106,19 @@ def train_reward_model():
             optimizer.step()
 
             with torch.no_grad():
-                correct = (chosen_score > rejected_score).float().item()
-                total_correct += correct
-                total_examples += 1
-                total_loss += loss.item()
+                batch_examples = chosen_score.shape[0]
+                total_correct += (chosen_score > rejected_score).float().sum().item()
+                total_examples += batch_examples
+                total_loss += loss.item() * batch_examples
 
-            if (i + 1) % PRINT_EVERY == 0:
-                avg_loss = total_loss / total_examples
-                accuracy = total_correct / total_examples
+            if (batch_index + 1) % CONFIG.PRINT_EVERY == 0:
                 print(
-                    f"epoch {epoch + 1}/{NUM_EPOCHS} "
-                    f"step {i + 1}/{len(select_sample)} "
-                    f"loss={avg_loss:.4f} accuracy={accuracy:.4f} "
-                    f"chosen_score={chosen_score.item():.4f} "
-                    f"rejected_score={rejected_score.item():.4f}"
+                    f"epoch {epoch + 1}/{CONFIG.NUM_EPOCHS} "
+                    f"batch {batch_index + 1}/{len(train_loader)} "
+                    f"loss={total_loss / total_examples:.4f} "
+                    f"accuracy={total_correct / total_examples:.4f} "
+                    f"chosen_score={chosen_score.mean().item():.4f} "
+                    f"rejected_score={rejected_score.mean().item():.4f}"
                 )
 
         print("Epoch average loss:", total_loss / total_examples)
@@ -180,47 +133,22 @@ def train_reward_model():
         # on examples the reward model did not see during training.
 
         with torch.no_grad():
-            for i in range(len(test_sample)):
-                example = test_sample[i]
-                chosen_tokens = tokenizer(
-                    example["chosen"],
-                    max_length=MAX_LENGTH,
-                    truncation=True,
-                    padding="max_length",
-                    return_tensors="pt",
-                )
-
-                rejected_tokens = tokenizer(
-                    example["rejected"],
-                    max_length=MAX_LENGTH,
-                    truncation=True,
-                    padding="max_length",
-                    return_tensors="pt",
-                )
-
-                # attention mask marks 1 as a real token and 0 as a padding token. Tells the model this is text and this is padding
-                # .shape represents [batch size, sequence length]
-
-                chosen_input_ids = chosen_tokens["input_ids"].to(device)
-                chosen_attention_mask = chosen_tokens["attention_mask"].to(device)
-                rejected_input_ids = rejected_tokens["input_ids"].to(device)
-                rejected_attention_mask = rejected_tokens["attention_mask"].to(device)
-
+            for batch in test_loader:
                 chosen_score = reward_model(
-                    chosen_input_ids,
-                    chosen_attention_mask,
+                    batch["chosen_input_ids"].to(device),
+                    batch["chosen_attention_mask"].to(device),
                 )
                 rejected_score = reward_model(
-                    rejected_input_ids,
-                    rejected_attention_mask,
+                    batch["rejected_input_ids"].to(device),
+                    batch["rejected_attention_mask"].to(device),
                 )
 
                 loss = -F.logsigmoid(chosen_score - rejected_score).mean()
-                correct = (chosen_score > rejected_score).float().item()
 
-                test_correct += correct
-                test_examples += 1
-                test_loss += loss.item()
+                batch_examples = chosen_score.shape[0]
+                test_correct += (chosen_score > rejected_score).float().sum().item()
+                test_examples += batch_examples
+                test_loss += loss.item() * batch_examples
 
         avg_test_loss = test_loss / test_examples
         test_accuracy = test_correct / test_examples
@@ -230,88 +158,8 @@ def train_reward_model():
         # Save based on the held-out preference loss; accuracy is only a diagnostic.
         if avg_test_loss < best_test_loss:
             best_test_loss = avg_test_loss
-            torch.save(reward_model.state_dict(), BEST_MODEL_PATH)
-            print("Saved new best reward model:", BEST_MODEL_PATH)
-
-        reward_model.eval()
-
-
-
-class RewardModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = AutoModel.from_pretrained(REWARD_MODEL_NAME)
-        hidden_size = self.backbone.config.hidden_size
-        self.reward_head = nn.Linear(hidden_size, 1) # in our case it will be 768 
-
-    def forward(self, input_ids, attention_mask):
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-
-        # # get the last hidden state which represents the value
-        # last_hidden = outputs.hidden_states[-1] # last_hidden.shape is [1, 512, 768]. 1 example in each batch, 512 tokens for each example and 768 numbers for each token
-        # last_token_index = attention_mask.sum(dim=1) - 1 # last token in an example
-        # batch_index = torch.arange(input_ids.shape[0], device=input_ids.device) # gpu optimization step 
-        # final_token_hidden = last_hidden[batch_index, last_token_index] # grabs the hidden vector at the last token position
-        # # print(final_token_hidden.shape) # the shape will be [1,768] because the last token has 768 n_embds used to represent it
-        # score = self.reward_head(final_token_hidden)
-
-
-        # BERT is an encoder model. It reads the full sequence bidirectionally.
-        # pooler_output is one vector for the whole sequence, based on the [CLS] token.
-        pooled_output = outputs.pooler_output # pooled_output.shape is [batch size, 768] for bert-base
-        score = self.reward_head(pooled_output)
-        return score
-
-# 1. Pass tokens through BERT encoder backbone
-# 2. Get pooler_output, which is one vector for the whole sequence
-# 3. Pass that pooled vector through a linear layer
-# 4. Output one number
-
-
-class PolicyModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.tokenizer = self.create_tokenizer()
-        self.backbone = AutoModelForCausalLM.from_pretrained(POLICY_MODEL_NAME)
-        self.backbone.resize_token_embeddings(len(self.tokenizer))
-        hidden_size = self.backbone.config.hidden_size  # 768 for distilgpt2
-
-        # The value head predicts for every token position how good the model expects the state to be
-        # PPO uses these values to compute advantages
-        # maps token's hidden vector (768) to 1
-        self.value_head = nn.Linear(hidden_size, 1)
-
-    def create_tokenizer(self):
-        tokenizer = AutoTokenizer.from_pretrained(POLICY_MODEL_NAME)
-        special_tokens = {
-            "additional_special_tokens": POLICY_SPECIAL_TOKENS,
-            "pad_token": POLICY_PAD_TOKEN,
-        }
-        tokenizer.add_special_tokens(special_tokens)
-        return tokenizer
-
-    def format_text(self, text):
-        return (
-            text.replace("Human:", "<|Human|>")
-            .replace("\n\nAssistant:", "\n\n<|Assistant|>")
-        )
-
-    def forward(self, input_ids, attention_mask):
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-
-        # logits: what token should come next at each position. shape is [batch, seq_len, vocab_size] vocab_size represents the total number of unique building blocks that the model's tokenizer can read
-        logits = outputs.logits # score for every possible token in distilgpt2
-        last_hidden = outputs.hidden_states[-1] # last_hidden is the final layer's hidden state for every token. shape is [batch, seq_len, hidden_size]
-        values = self.value_head(last_hidden).squeeze(-1) # squeeze the trailing 1. shape is [batch,seq_len]
-
-        return logits, values
+            torch.save(reward_model.state_dict(), CONFIG.BEST_MODEL_PATH)
+            print("Saved new best reward model:", CONFIG.BEST_MODEL_PATH)
 
 
 def get_answer_stats(logits, values, input_ids, prompt_length):
@@ -327,7 +175,7 @@ def get_answer_stats(logits, values, input_ids, prompt_length):
     return answer_log_probs, answer_values, entropy
 
 
-def generate_rollout(policy, prompt, max_new_tokens=MAX_NEW_TOKENS, temperature=1.0):
+def generate_rollout(policy, prompt, max_new_tokens=CONFIG.MAX_NEW_TOKENS, temperature=1.0):
     tokenizer = policy.tokenizer
     device = next(policy.parameters()).device
 
@@ -401,13 +249,13 @@ def get_reference_log_probs(reference_model, rollout):
 
 
 def load_reward_model(device):
-    if not os.path.exists(BEST_MODEL_PATH):
+    if not os.path.exists(CONFIG.BEST_MODEL_PATH):
         raise FileNotFoundError(
-            f"{BEST_MODEL_PATH} was not found. Run `uv run python train.py reward` first."
+            f"{CONFIG.BEST_MODEL_PATH} was not found. Run `uv run python train.py reward` first."
         )
 
     reward_model = RewardModel().to(device)
-    state_dict = torch.load(BEST_MODEL_PATH, map_location=device, weights_only=True)
+    state_dict = torch.load(CONFIG.BEST_MODEL_PATH, map_location=device, weights_only=True)
     reward_model.load_state_dict(state_dict)
     reward_model.eval()
     for parameter in reward_model.parameters():
@@ -420,7 +268,7 @@ def score_response(reward_model, reward_tokenizer, prompt, generated_text):
     text = prompt + generated_text
     tokens = reward_tokenizer(
         text,
-        max_length=MAX_LENGTH,
+        max_length=CONFIG.MAX_LENGTH,
         truncation=True,
         padding=True,
         return_tensors="pt",
@@ -448,10 +296,10 @@ def compute_advantages(old_values, token_rewards):
 
         delta = (
             token_rewards[:, token_index]
-            + GAMMA * next_value
+            + CONFIG.GAMMA * next_value
             - old_values[:, token_index]
         )
-        last_advantage = delta + GAMMA * GAE_LAMBDA * last_advantage
+        last_advantage = delta + CONFIG.GAMMA * CONFIG.GAE_LAMBDA * last_advantage
         advantages[:, token_index] = last_advantage
 
     returns = advantages + old_values
@@ -479,7 +327,7 @@ def ppo_update(policy, optimizer, rollouts):
     # weight change, causing spurious clipping. Gradients still flow in eval.
     policy.eval()
 
-    for _ in range(PPO_EPOCHS):
+    for _ in range(CONFIG.PPO_EPOCHS):
         totals = {
             "loss": 0.0,
             "policy_loss": 0.0,
@@ -503,16 +351,16 @@ def ppo_update(policy, optimizer, rollouts):
             unclipped_objective = ratio * advantages
             clipped_objective = torch.clamp(
                 ratio,
-                1.0 - PPO_CLIP_RANGE,
-                1.0 + PPO_CLIP_RANGE,
+                1.0 - CONFIG.PPO_CLIP_RANGE,
+                1.0 + CONFIG.PPO_CLIP_RANGE,
             ) * advantages
             policy_loss = -torch.min(unclipped_objective, clipped_objective).mean()
 
             old_values = rollout["old_values"]
             clipped_values = old_values + torch.clamp(
                 current_values - old_values,
-                -VALUE_CLIP_RANGE,
-                VALUE_CLIP_RANGE,
+                -CONFIG.VALUE_CLIP_RANGE,
+                CONFIG.VALUE_CLIP_RANGE,
             )
             value_loss = 0.5 * torch.max(
                 (current_values - rollout["returns"]).pow(2),
@@ -521,8 +369,8 @@ def ppo_update(policy, optimizer, rollouts):
             entropy_bonus = entropy.mean()
             loss = (
                 policy_loss
-                + VALUE_LOSS_COEF * value_loss
-                - ENTROPY_COEF * entropy_bonus
+                + CONFIG.VALUE_LOSS_COEF * value_loss
+                - CONFIG.ENTROPY_COEF * entropy_bonus
             )
 
             # One optimizer step per epoch: each rollout contributes
@@ -534,10 +382,10 @@ def ppo_update(policy, optimizer, rollouts):
             totals["value_loss"] += value_loss.item()
             totals["entropy"] += entropy_bonus.item()
             totals["clip_fraction"] += (
-                ((ratio - 1.0).abs() > PPO_CLIP_RANGE).float().mean().item()
+                ((ratio - 1.0).abs() > CONFIG.PPO_CLIP_RANGE).float().mean().item()
             )
 
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), CONFIG.MAX_GRAD_NORM)
         optimizer.step()
         metrics = {name: total / len(rollouts) for name, total in totals.items()}
 
@@ -550,14 +398,14 @@ def train_ppo(prompts, num_steps=10):
     reward_model = load_reward_model(device)
     policy = PolicyModel().to(device)
     reference_model = create_reference_model(policy)
-    reward_tokenizer = AutoTokenizer.from_pretrained(REWARD_MODEL_NAME)
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=PPO_LEARNING_RATE)
+    reward_tokenizer = AutoTokenizer.from_pretrained(CONFIG.REWARD_MODEL_NAME)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=CONFIG.PPO_LEARNING_RATE)
 
     for step in range(num_steps):
         rollouts = []
-        for rollout_index in range(ROLLOUTS_PER_STEP):
+        for rollout_index in range(CONFIG.ROLLOUTS_PER_STEP):
             prompt = prompts[
-                (step * ROLLOUTS_PER_STEP + rollout_index) % len(prompts)
+                (step * CONFIG.ROLLOUTS_PER_STEP + rollout_index) % len(prompts)
             ]
             rollout = generate_rollout(policy, prompt)
             reference_log_probs = get_reference_log_probs(reference_model, rollout)
@@ -570,7 +418,7 @@ def train_ppo(prompts, num_steps=10):
 
             with torch.no_grad():
                 log_ratio = rollout["old_log_probs"] - reference_log_probs
-                token_rewards = -KL_COEF * log_ratio
+                token_rewards = -CONFIG.KL_COEF * log_ratio
                 token_rewards[:, -1] += reward_score
                 advantages, returns = compute_advantages(
                     rollout["old_values"],
@@ -596,8 +444,8 @@ def train_ppo(prompts, num_steps=10):
             f"sample={rollouts[0]['generated_text']!r}"
         )
 
-    torch.save(policy.state_dict(), PPO_MODEL_PATH)
-    print("Saved PPO policy:", PPO_MODEL_PATH)
+    torch.save(policy.state_dict(), CONFIG.PPO_MODEL_PATH)
+    print("Saved PPO policy:", CONFIG.PPO_MODEL_PATH)
     return policy
 
 

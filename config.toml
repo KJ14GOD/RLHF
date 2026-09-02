@@ -1,0 +1,35 @@
+# All tunable values for the RLHF pipeline. Loaded by config.py.
+# Modify token length / batch size based on gpu.
+
+[model]
+reward_model_name = "google-bert/bert-base-cased"
+policy_model_name = "distilgpt2"
+
+[reward]
+max_length = 512
+learning_rate = 1e-5
+train_examples = 500
+test_examples = 500
+batch_size = 8
+print_every = 10
+num_epochs = 2
+best_model_path = "best_reward_model.pt"
+
+[policy]
+ppo_model_path = "ppo_policy_model.pt"
+policy_special_tokens = ["<|Human|>", "<|Assistant|>"]
+policy_pad_token = "<|pad|>"
+
+[ppo]
+ppo_learning_rate = 1e-6
+ppo_clip_range = 0.2
+value_clip_range = 0.2
+value_loss_coef = 0.5
+entropy_coef = 0.01
+kl_coef = 0.05
+gamma = 1.0
+gae_lambda = 0.95
+max_grad_norm = 1.0
+max_new_tokens = 64
+ppo_epochs = 4
+rollouts_per_step = 8
