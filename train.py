@@ -186,6 +186,7 @@ def generate_rollout(policy, prompt, max_new_tokens=CONFIG.MAX_NEW_TOKENS, tempe
 
     prompt_length = input_ids.shape[1]
     policy.eval()
+    finished = False
 
     with torch.no_grad():
         for _ in range(max_new_tokens):
@@ -201,6 +202,7 @@ def generate_rollout(policy, prompt, max_new_tokens=CONFIG.MAX_NEW_TOKENS, tempe
             attention_mask = torch.cat([attention_mask, torch.ones_like(next_token_id)] , dim=1,)
 
             if next_token_id.item() == tokenizer.eos_token_id:
+                finished = True
                 break
 
     generated_ids = input_ids[:, prompt_length:]
@@ -214,6 +216,9 @@ def generate_rollout(policy, prompt, max_new_tokens=CONFIG.MAX_NEW_TOKENS, tempe
             input_ids,
             prompt_length,
         )
+        # Value of the state after the last generated token, used to bootstrap
+        # GAE when generation stopped at the token budget instead of EOS.
+        final_value = values[:, -1]
 
     return {
         "input_ids": input_ids,
@@ -223,6 +228,8 @@ def generate_rollout(policy, prompt, max_new_tokens=CONFIG.MAX_NEW_TOKENS, tempe
         "generated_text": generated_text,
         "old_log_probs": old_log_probs,
         "old_values": old_values,
+        "final_value": final_value,
+        "finished": finished,
     }
 
 
@@ -265,7 +272,10 @@ def load_reward_model(device):
 
 def score_response(reward_model, reward_tokenizer, prompt, generated_text):
     device = next(reward_model.parameters()).device
+    # hh-rlhf transcripts start with "\n\nHuman:", so score in that same format.
     text = prompt + generated_text
+    if not text.startswith("\n\n"):
+        text = "\n\n" + text
     tokens = reward_tokenizer(
         text,
         max_length=CONFIG.MAX_LENGTH,
@@ -281,7 +291,7 @@ def score_response(reward_model, reward_tokenizer, prompt, generated_text):
     return score.squeeze()
 
 
-def compute_advantages(old_values, token_rewards):
+def compute_advantages(old_values, token_rewards, final_value, finished):
     advantages = torch.zeros_like(token_rewards)
     last_advantage = torch.zeros(
         token_rewards.shape[0],
@@ -290,7 +300,13 @@ def compute_advantages(old_values, token_rewards):
 
     for token_index in reversed(range(token_rewards.shape[1])):
         if token_index == token_rewards.shape[1] - 1:
-            next_value = torch.zeros_like(last_advantage)
+            if finished:
+                # Ended with EOS: the episode is really over, nothing follows.
+                next_value = torch.zeros_like(last_advantage)
+            else:
+                # Ran out of token budget: the episode was cut off, so
+                # bootstrap from the value of the state after the last token.
+                next_value = final_value
         else:
             next_value = old_values[:, token_index + 1]
 
@@ -399,6 +415,9 @@ def train_ppo(prompts, num_steps=10):
     policy = PolicyModel().to(device)
     reference_model = create_reference_model(policy)
     reward_tokenizer = AutoTokenizer.from_pretrained(CONFIG.REWARD_MODEL_NAME)
+    # Match reward-model training: truncate from the left so the end of the
+    # conversation (the response being scored) survives truncation.
+    reward_tokenizer.truncation_side = "left"
     optimizer = torch.optim.AdamW(policy.parameters(), lr=CONFIG.PPO_LEARNING_RATE)
 
     for step in range(num_steps):
@@ -423,6 +442,8 @@ def train_ppo(prompts, num_steps=10):
                 advantages, returns = compute_advantages(
                     rollout["old_values"],
                     token_rewards,
+                    rollout["final_value"],
+                    rollout["finished"],
                 )
 
             rollout["advantages"] = advantages
