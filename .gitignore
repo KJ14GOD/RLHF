@@ -12,3 +12,6 @@ __pycache__/
 *.pt
 *.pth
 *.ckpt
+
+# Novus chat attachments (local only, can be large)
+.novus/attachments/
